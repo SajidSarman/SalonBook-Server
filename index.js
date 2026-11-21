@@ -33,6 +33,7 @@ const users = database.collection("user");
 // const services = database.collection("services");
 const serviceCollection = database.collection("services");
 const appointments = database.collection("appointments");
+const transactions = database.collection("transactions");
 const appointmentTimeSlots = [
   "09:00",
   "10:00",
@@ -52,6 +53,11 @@ await appointments.createIndex(
     partialFilterExpression: { slotActive: true },
     name: "unique-active-appointment-slot",
   }
+);
+
+await transactions.createIndex(
+  { stripeSessionId: 1 },
+  { unique: true }
 );
 
 app.get("/", (_req, res) => {
@@ -628,6 +634,117 @@ app.patch("/appointments/:id/status", async (req, res) => {
   }
 });
 
+// Called by the verified Stripe webhook in the Next.js app. Records the
+// transaction (idempotently, keyed by Stripe session) and marks the
+// appointment as paid.
+app.post("/transactions", async (req, res) => {
+  try {
+    const {
+      appointmentId,
+      customerId,
+      amount,
+      currency,
+      stripeSessionId,
+      status,
+    } = req.body ?? {};
+
+    if (
+      typeof appointmentId !== "string" ||
+      !ObjectId.isValid(appointmentId) ||
+      typeof customerId !== "string" ||
+      typeof amount !== "number" ||
+      !Number.isFinite(amount) ||
+      amount < 0 ||
+      typeof currency !== "string" ||
+      currency.length === 0 ||
+      typeof stripeSessionId !== "string" ||
+      stripeSessionId.length === 0 ||
+      (status !== "paid" && status !== "failed")
+    ) {
+      return res.status(400).json({ message: "Invalid transaction." });
+    }
+
+    const appointment = await appointments.findOne({
+      _id: new ObjectId(appointmentId),
+      customerId,
+    });
+
+    if (!appointment) {
+      return res.status(404).json({ message: "Appointment not found." });
+    }
+
+    const normalizedCurrency = currency.toUpperCase();
+
+    try {
+      await transactions.updateOne(
+        { stripeSessionId },
+        status === "paid"
+          ? {
+              $set: {
+                appointmentId,
+                customerId,
+                amount,
+                currency: normalizedCurrency,
+                status,
+              },
+              $setOnInsert: { createdAt: new Date() },
+            }
+          : {
+              $setOnInsert: {
+                appointmentId,
+                customerId,
+                amount,
+                currency: normalizedCurrency,
+                status,
+                createdAt: new Date(),
+              },
+            },
+        { upsert: true }
+      );
+    } catch (error) {
+      // Concurrent deliveries of the same event can race on the unique index.
+      if (
+        !(
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === 11000
+        )
+      ) {
+        throw error;
+      }
+    }
+
+    if (status === "paid" && appointment.paymentStatus !== "Paid") {
+      await appointments.updateOne(
+        {
+          _id: appointment._id,
+          customerId,
+          paymentStatus: { $ne: "Paid" },
+        },
+        { $set: { paymentStatus: "Paid" } }
+      );
+    }
+
+    res.status(201).json({ stripeSessionId, status });
+  } catch (error) {
+    console.error("Failed to save transaction:", error);
+    res.status(500).json({ message: "Failed to save transaction." });
+  }
+});
+
+app.get("/transactions", async (_req, res) => {
+  try {
+    const result = await transactions
+      .find({})
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+    res.json(result);
+  } catch (error) {
+    console.error("Failed to fetch transactions:", error);
+    res.status(500).json({ message: "Failed to fetch transactions." });
+  }
+});
 
 app.use((error, _req, res, _next) => {
   console.error("API request failed:", error);
