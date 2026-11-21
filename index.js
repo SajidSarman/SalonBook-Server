@@ -117,6 +117,168 @@ app.patch("/admin/users/:id", async (req, res) => {
   }
 });
 
+app.get("/admin/overview", async (_req, res) => {
+  try {
+    const [
+      totalCustomers,
+      activeServices,
+      totalAppointments,
+      pendingAppointments,
+      confirmedAppointments,
+    ] = await Promise.all([
+      users.countDocuments({ role: { $ne: "admin" } }),
+      serviceCollection.countDocuments({ status: "active" }),
+      appointments.countDocuments(),
+      appointments.countDocuments({ status: "Pending" }),
+      appointments.countDocuments({ status: "Confirmed" }),
+    ]);
+
+    res.json({
+      totalCustomers,
+      activeServices,
+      totalAppointments,
+      pendingAppointments,
+      confirmedAppointments,
+      successfulPayments: null,
+    });
+  } catch (error) {
+    console.error("Failed to fetch admin overview:", error);
+    res.status(500).json({ message: "Failed to fetch admin overview." });
+  }
+});
+
+app.get("/admin/services", async (_req, res) => {
+  try {
+    const result = await serviceCollection
+      .find({})
+      .sort({ _id: -1 })
+      .toArray();
+    res.json(result);
+  } catch (error) {
+    console.error("Failed to fetch admin services:", error);
+    res.status(500).json({ message: "Failed to fetch services." });
+  }
+});
+
+app.post("/admin/services", async (req, res) => {
+  try {
+    const { serviceName, category, description, price, duration, status } =
+      req.body ?? {};
+
+    if (
+      typeof serviceName !== "string" ||
+      !serviceName.trim() ||
+      typeof category !== "string" ||
+      !category.trim() ||
+      typeof description !== "string" ||
+      !description.trim() ||
+      typeof price !== "number" ||
+      !Number.isFinite(price) ||
+      price <= 0 ||
+      typeof duration !== "number" ||
+      !Number.isFinite(duration) ||
+      duration <= 0 ||
+      (status !== undefined && status !== "active" && status !== "inactive")
+    ) {
+      return res.status(400).json({ message: "Invalid service details." });
+    }
+
+    const service = {
+      serviceName: serviceName.trim(),
+      category: category.trim(),
+      description: description.trim(),
+      price,
+      duration,
+      image: null,
+      status: status ?? "active",
+      createdAt: new Date(),
+    };
+    const result = await serviceCollection.insertOne(service);
+    res.status(201).json({ ...service, _id: result.insertedId.toString() });
+  } catch (error) {
+    console.error("Failed to create service:", error);
+    res.status(500).json({ message: "Failed to create service." });
+  }
+});
+
+app.patch("/admin/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { serviceName, category, description, price, duration, status } =
+      req.body ?? {};
+
+    if (
+      !ObjectId.isValid(id) ||
+      typeof serviceName !== "string" ||
+      !serviceName.trim() ||
+      typeof category !== "string" ||
+      !category.trim() ||
+      typeof description !== "string" ||
+      !description.trim() ||
+      typeof price !== "number" ||
+      !Number.isFinite(price) ||
+      price <= 0 ||
+      typeof duration !== "number" ||
+      !Number.isFinite(duration) ||
+      duration <= 0 ||
+      (status !== "active" && status !== "inactive")
+    ) {
+      return res.status(400).json({ message: "Invalid service details." });
+    }
+
+    const result = await serviceCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          serviceName: serviceName.trim(),
+          category: category.trim(),
+          description: description.trim(),
+          price,
+          duration,
+          status,
+        },
+      }
+    );
+
+    if (result.matchedCount !== 1) {
+      return res.status(404).json({ message: "Service not found." });
+    }
+
+    res.json({
+      id,
+      serviceName,
+      category,
+      description,
+      price,
+      duration,
+      status,
+    });
+  } catch (error) {
+    console.error("Failed to update service:", error);
+    res.status(500).json({ message: "Failed to update service." });
+  }
+});
+
+app.delete("/admin/services/:id", async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ message: "Invalid service ID." });
+    }
+
+    const result = await serviceCollection.deleteOne({
+      _id: new ObjectId(req.params.id),
+    });
+    if (result.deletedCount !== 1) {
+      return res.status(404).json({ message: "Service not found." });
+    }
+
+    res.json({ id: req.params.id, deleted: true });
+  } catch (error) {
+    console.error("Failed to delete service:", error);
+    res.status(500).json({ message: "Failed to delete service." });
+  }
+});
+
 // Public: homepage featured services -> GET /top6services
 app.get("/top6services", async (req, res) => {
   try {
