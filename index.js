@@ -221,6 +221,7 @@ app.post("/appointments", async (req, res) => {
         timeSlot,
         additionalMessage: additionalMessage ?? "",
         status: "Pending",
+        servicePrice: service.price,
         paymentStatus: "Unpaid",
         slotActive: true,
         createdAt: new Date(),
@@ -230,6 +231,7 @@ app.post("/appointments", async (req, res) => {
         id: result.insertedId.toString(),
         status: "Pending",
         paymentStatus: "Unpaid",
+        servicePrice: service.price,
       });
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === 11000) {
