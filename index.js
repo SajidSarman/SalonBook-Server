@@ -58,11 +58,62 @@ app.get("/", (_req, res) => {
   res.send("TESTING...");
 });
 
-app.get("/users", async (_req, res, next) => {
+// Admin user management. Requests are role-checked by the Next.js API proxy.
+app.get("/admin/users", async (_req, res) => {
   try {
-    res.json(await users.find({}).toArray());
+    const result = await users
+      .find({})
+      .project({
+        name: 1,
+        email: 1,
+        image: 1,
+        role: 1,
+        isBlocked: 1,
+      })
+      .sort({ name: 1 })
+      .toArray();
+
+    res.json(
+      result.map((user) => ({
+        id: user._id.toString(),
+        name: typeof user.name === "string" ? user.name : "",
+        email: typeof user.email === "string" ? user.email : "",
+        image: typeof user.image === "string" ? user.image : null,
+        role: user.role === "admin" ? "admin" : "customer",
+        isBlocked: user.isBlocked === true,
+      }))
+    );
   } catch (error) {
-    next(error);
+    console.error("Failed to fetch users:", error);
+    res.status(500).json({ message: "Failed to fetch users." });
+  }
+});
+
+app.patch("/admin/users/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isBlocked } = req.body ?? {};
+
+    if (!id || typeof isBlocked !== "boolean") {
+      return res.status(400).json({ message: "Invalid user update." });
+    }
+
+    const userIdFilter = ObjectId.isValid(id)
+      ? { $or: [{ _id: id }, { _id: new ObjectId(id) }] }
+      : { _id: id };
+    const result = await users.updateOne(
+      { $and: [userIdFilter, { role: { $ne: "admin" } }] },
+      { $set: { isBlocked } }
+    );
+
+    if (result.matchedCount !== 1) {
+      return res.status(404).json({ message: "Customer user not found." });
+    }
+
+    res.json({ id, isBlocked });
+  } catch (error) {
+    console.error("Failed to update user:", error);
+    res.status(500).json({ message: "Failed to update user." });
   }
 });
 
