@@ -346,10 +346,90 @@ app.get("/appointments", async (req, res) => {
       .sort({ appointmentDate: -1, timeSlot: -1, _id: -1 })
       .toArray();
 
-    res.json(result);
+    const serviceIds = result
+      .map(({ serviceId }) =>
+        typeof serviceId === "string" && ObjectId.isValid(serviceId)
+          ? new ObjectId(serviceId)
+          : null
+      )
+      .filter((id) => id !== null);
+    const serviceDocuments =
+      serviceIds.length > 0
+        ? await serviceCollection
+            .find({ _id: { $in: serviceIds } })
+            .project({ category: 1, image: 1 })
+            .toArray()
+        : [];
+    const servicesById = new Map(
+      serviceDocuments.map((service) => [service._id.toString(), service])
+    );
+
+    res.json(
+      result.map((appointment) => {
+        const service =
+          typeof appointment.serviceId === "string"
+            ? servicesById.get(appointment.serviceId)
+            : undefined;
+
+        return {
+          ...appointment,
+          serviceCategory:
+            typeof appointment.serviceCategory === "string"
+              ? appointment.serviceCategory
+              : service?.category ?? "",
+          serviceImage:
+            typeof appointment.serviceImage === "string"
+              ? appointment.serviceImage
+              : service?.image ?? null,
+        };
+      })
+    );
   } catch (error) {
     console.error("Failed to fetch appointments:", error);
     res.status(500).json({ message: "Failed to fetch appointments." });
+  }
+});
+
+app.get("/appointments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { customerId } = req.query;
+
+    if (!ObjectId.isValid(id) || typeof customerId !== "string") {
+      return res.status(404).json({ message: "Appointment not found." });
+    }
+
+    const appointment = await appointments.findOne({
+      _id: new ObjectId(id),
+      customerId,
+    });
+    if (!appointment) {
+      return res.status(404).json({ message: "Appointment not found." });
+    }
+
+    const service =
+      typeof appointment.serviceId === "string" &&
+      ObjectId.isValid(appointment.serviceId)
+        ? await serviceCollection.findOne(
+            { _id: new ObjectId(appointment.serviceId) },
+            { projection: { category: 1, image: 1 } }
+          )
+        : null;
+
+    res.json({
+      ...appointment,
+      serviceCategory:
+        typeof appointment.serviceCategory === "string"
+          ? appointment.serviceCategory
+          : service?.category ?? "",
+      serviceImage:
+        typeof appointment.serviceImage === "string"
+          ? appointment.serviceImage
+          : service?.image ?? null,
+    });
+  } catch (error) {
+    console.error("Failed to fetch appointment:", error);
+    res.status(500).json({ message: "Failed to fetch appointment." });
   }
 });
 
@@ -427,6 +507,8 @@ app.post("/appointments", async (req, res) => {
       const result = await appointments.insertOne({
         serviceId: service._id.toString(),
         serviceName: service.serviceName,
+        serviceCategory: service.category ?? "",
+        serviceImage: service.image ?? null,
         customerId: customer.id,
         customerName: customer.name,
         customerEmail: customer.email,
