@@ -2,6 +2,7 @@ import express from "express";
 import "dotenv/config";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -10,6 +11,12 @@ const mongoUri = process.env.MONGODB_URI;
 if (!mongoUri) {
   throw new Error("MONGODB_URI is not set");
 }
+
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("STRIPE_SECRET_KEY is not set");
+}
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use(express.json());
 app.use(cors());
@@ -131,12 +138,14 @@ app.get("/admin/overview", async (_req, res) => {
       totalAppointments,
       pendingAppointments,
       confirmedAppointments,
+      successfulPayments,
     ] = await Promise.all([
       users.countDocuments({ role: { $ne: "admin" } }),
       serviceCollection.countDocuments({ status: "active" }),
       appointments.countDocuments(),
       appointments.countDocuments({ status: "Pending" }),
       appointments.countDocuments({ status: "Confirmed" }),
+      transactions.countDocuments({ status: "paid" }),
     ]);
 
     res.json({
@@ -145,7 +154,7 @@ app.get("/admin/overview", async (_req, res) => {
       totalAppointments,
       pendingAppointments,
       confirmedAppointments,
-      successfulPayments: null,
+      successfulPayments,
     });
   } catch (error) {
     console.error("Failed to fetch admin overview:", error);
@@ -634,34 +643,104 @@ app.patch("/appointments/:id/status", async (req, res) => {
   }
 });
 
-// Called by the verified Stripe webhook in the Next.js app. Records the
-// transaction (idempotently, keyed by Stripe session) and marks the
-// appointment as paid.
+// Called by the verified Stripe webhook in the Next.js app. The caller only
+// supplies a Checkout Session id; every value written to the database is read
+// back from Stripe, so a forged request cannot fake a payment.
 app.post("/transactions", async (req, res) => {
   try {
-    const {
-      appointmentId,
-      customerId,
-      amount,
-      currency,
-      stripeSessionId,
-      status,
-    } = req.body ?? {};
+    const { stripeSessionId, status } = req.body ?? {};
 
     if (
-      typeof appointmentId !== "string" ||
-      !ObjectId.isValid(appointmentId) ||
-      typeof customerId !== "string" ||
-      typeof amount !== "number" ||
-      !Number.isFinite(amount) ||
-      amount < 0 ||
-      typeof currency !== "string" ||
-      currency.length === 0 ||
       typeof stripeSessionId !== "string" ||
       stripeSessionId.length === 0 ||
       (status !== "paid" && status !== "failed")
     ) {
       return res.status(400).json({ message: "Invalid transaction." });
+    }
+
+    // Fast path: a paid transaction for this session has already been recorded.
+    // Stripe sessions can only be paid once, so reloading the success page (or
+    // Stripe retrying the webhook) has nothing new to write and does not need
+    // another call to Stripe.
+    if (status === "paid") {
+      const existing = await transactions.findOne({ stripeSessionId });
+
+      if (existing?.status === "paid") {
+        // The transaction insert and the appointment update are not atomic. If
+        // the process died in between, heal the appointment on the retry.
+        if (
+          typeof existing.appointmentId === "string" &&
+          ObjectId.isValid(existing.appointmentId) &&
+          typeof existing.customerId === "string"
+        ) {
+          await appointments.updateOne(
+            {
+              _id: new ObjectId(existing.appointmentId),
+              customerId: existing.customerId,
+              paymentStatus: { $ne: "Paid" },
+            },
+            { $set: { paymentStatus: "Paid" } }
+          );
+        }
+
+        return res.send({
+          success: false,
+          message: "Payment already verified",
+        });
+      }
+    }
+
+    let session;
+    try {
+      session = await stripe.checkout.sessions.retrieve(stripeSessionId);
+    } catch (error) {
+      if (
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "resource_missing"
+      ) {
+        return res.status(404).json({ message: "Checkout session not found." });
+      }
+      throw error;
+    }
+
+    const appointmentId =
+      session.metadata?.appointmentId ?? session.client_reference_id ?? null;
+    const customerId = session.metadata?.customerId ?? null;
+    // Checkout finished AND the money was actually captured. `status` alone is
+    // not enough: delayed payment methods complete checkout while unpaid.
+    const paid =
+      session.status === "complete" && session.payment_status === "paid";
+
+    if (
+      typeof appointmentId !== "string" ||
+      !ObjectId.isValid(appointmentId) ||
+      typeof customerId !== "string" ||
+      customerId.length === 0
+    ) {
+      return res.status(409).json({
+        message: "Checkout session is missing appointment metadata.",
+      });
+    }
+
+    // A paid session can never be recorded as failed, and an unpaid session can
+    // never be recorded as paid.
+    if ((status === "paid") !== paid) {
+      return res.status(409).json({
+        message: "Checkout session status does not match the transaction.",
+      });
+    }
+
+    if (
+      typeof session.amount_total !== "number" ||
+      !Number.isFinite(session.amount_total) ||
+      typeof session.currency !== "string" ||
+      session.currency.length === 0
+    ) {
+      return res.status(409).json({
+        message: "Checkout session is missing its amount or currency.",
+      });
     }
 
     const appointment = await appointments.findOne({
@@ -673,18 +752,31 @@ app.post("/transactions", async (req, res) => {
       return res.status(404).json({ message: "Appointment not found." });
     }
 
-    const normalizedCurrency = currency.toUpperCase();
+    if (appointment.status !== "Confirmed") {
+      return res.status(409).json({
+        message: "Appointment is no longer confirmed.",
+      });
+    }
+
+    const amount = Number((session.amount_total / 100).toFixed(2));
+    const currency = session.currency.toUpperCase();
+    // Snapshot of the email the customer paid with, as recorded by Stripe.
+    const customerEmail =
+      typeof session.customer_details?.email === "string"
+        ? session.customer_details.email
+        : null;
 
     try {
       await transactions.updateOne(
-        { stripeSessionId },
+        { stripeSessionId: session.id },
         status === "paid"
           ? {
               $set: {
                 appointmentId,
                 customerId,
+                customerEmail,
                 amount,
-                currency: normalizedCurrency,
+                currency,
                 status,
               },
               $setOnInsert: { createdAt: new Date() },
@@ -693,8 +785,9 @@ app.post("/transactions", async (req, res) => {
               $setOnInsert: {
                 appointmentId,
                 customerId,
+                customerEmail,
                 amount,
-                currency: normalizedCurrency,
+                currency,
                 status,
                 createdAt: new Date(),
               },
@@ -726,7 +819,15 @@ app.post("/transactions", async (req, res) => {
       );
     }
 
-    res.status(201).json({ stripeSessionId, status });
+    res.status(201).json({
+      stripeSessionId: session.id,
+      appointmentId,
+      customerId,
+      customerEmail,
+      amount,
+      currency,
+      status,
+    });
   } catch (error) {
     console.error("Failed to save transaction:", error);
     res.status(500).json({ message: "Failed to save transaction." });
@@ -739,7 +840,59 @@ app.get("/transactions", async (_req, res) => {
       .find({})
       .sort({ createdAt: -1, _id: -1 })
       .toArray();
-    res.json(result);
+
+    const customerIds = [
+      ...new Set(
+        result
+          .map((transaction) => transaction.customerId)
+          .filter((id) => typeof id === "string" && id.length > 0)
+      ),
+    ];
+
+    // `customerId` is stored as a string, but a user's `_id` is an ObjectId.
+    const customerKeys = customerIds.flatMap((id) =>
+      ObjectId.isValid(id) ? [id, new ObjectId(id)] : [id]
+    );
+
+    const customers =
+      customerKeys.length > 0
+        ? await users
+            .find(
+              { _id: { $in: customerKeys } },
+              { projection: { name: 1, email: 1 } }
+            )
+            .toArray()
+        : [];
+
+    const customersById = new Map(
+      customers.map((customer) => [
+        customer._id.toString(),
+        {
+          name: typeof customer.name === "string" ? customer.name : "",
+          email: typeof customer.email === "string" ? customer.email : "",
+        },
+      ])
+    );
+
+    res.json(
+      result.map((transaction) => {
+        const customer =
+          typeof transaction.customerId === "string"
+            ? customersById.get(transaction.customerId)
+            : null;
+
+        return {
+          ...transaction,
+          customerName: customer?.name ?? null,
+          // Prefer the email captured at payment time; fall back to the live
+          // account for transactions recorded before this field existed.
+          customerEmail:
+            typeof transaction.customerEmail === "string"
+              ? transaction.customerEmail
+              : (customer?.email ?? null),
+        };
+      })
+    );
   } catch (error) {
     console.error("Failed to fetch transactions:", error);
     res.status(500).json({ message: "Failed to fetch transactions." });
