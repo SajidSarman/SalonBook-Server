@@ -1,9 +1,9 @@
 # SalonBook Server
 
-REST API for SalonBook, built with Express and MongoDB. It verifies JWTs issued by the Next.js app, enforces role-based access, and handles the Stripe webhook.
+REST API for SalonBook, built with Express and MongoDB. It verifies JWTs issued by the Next.js app, enforces role-based access.
 
 ## Live API
-
+https://salonbook-b14-a09-server.vercel.app/
 
 ## Repositories
 - Client:
@@ -17,7 +17,7 @@ REST API for SalonBook, built with Express and MongoDB. It verifies JWTs issued 
 - Duplicate booking and inactive-service protection
 
 ## Technology Stack
-Node.js, Express, MongoDB, jose, Stripe
+Node.js, Express, MongoDB, jwt(jose), Stripe
 
 ## Installation
 ```bash
