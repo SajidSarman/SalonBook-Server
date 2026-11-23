@@ -1,12 +1,17 @@
 import express from "express";
 import "dotenv/config";
-import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 5000;
 const mongoUri = process.env.MONGODB_URI;
+const authBaseUrl = (
+  process.env.BETTER_AUTH_URL ?? "http://localhost:3000"
+).replace(/\/+$/, "");
+const jwtIssuer = process.env.JWT_ISSUER ?? authBaseUrl;
+const jwtAudience = process.env.JWT_AUDIENCE ?? "salonbook-api";
 
 if (!mongoUri) {
   throw new Error("MONGODB_URI is not set");
@@ -19,7 +24,6 @@ if (!process.env.STRIPE_SECRET_KEY) {
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use(express.json());
-app.use(cors());
 
 const client = new MongoClient(mongoUri);
 
@@ -67,12 +71,109 @@ await transactions.createIndex(
   { unique: true }
 );
 
+// Public keys published by Better Auth. The Next.js server mints every token;
+// this API only verifies signatures and never sees the session cookie or the
+// signing secret.
+const jwks = createRemoteJWKSet(new URL(`${authBaseUrl}/api/auth/jwks`));
+
+function userIdFilter(id) {
+  return ObjectId.isValid(id) ? { $in: [id, new ObjectId(id)] } : id;
+}
+
+/**
+ * Verifies `Authorization: Bearer <jwt>` and resolves the caller into
+ * `req.auth = { id, name, email, role }`.
+ *
+ * The token proves the identity, but the database stays the source of truth
+ * for role and blocked status, so a demotion or block applies immediately
+ * instead of waiting for the token to expire.
+ */
+async function verifyJWT(req, res, next) {
+  const [scheme, token] = (req.headers.authorization ?? "").split(" ");
+
+  if (scheme !== "Bearer" || !token) {
+    return res.status(401).json({ message: "Authentication required." });
+  }
+
+  let payload;
+  try {
+    ({ payload } = await jwtVerify(token, jwks, {
+      issuer: jwtIssuer,
+      audience: jwtAudience,
+      algorithms: ["EdDSA"],
+    }));
+  } catch {
+    return res.status(401).json({ message: "Invalid or expired token." });
+  }
+
+  const subject = typeof payload.sub === "string" ? payload.sub : "";
+  const tokenRole =
+    payload.role === "admin"
+      ? "admin"
+      : payload.role === "service"
+        ? "service"
+        : "customer";
+
+  // Trusted server-to-server caller (for example the Stripe webhook). It has
+  // no user row to reconcile and is restricted to the transaction endpoint.
+  if (tokenRole === "service") {
+    req.auth = { id: subject, name: "", email: "", role: "service" };
+    return next();
+  }
+
+  if (!subject) {
+    return res.status(401).json({ message: "Invalid or expired token." });
+  }
+
+  try {
+    const user = await users.findOne(
+      { _id: userIdFilter(subject) },
+      { projection: { name: 1, email: 1, role: 1, isBlocked: 1 } }
+    );
+
+    if (!user || user.isBlocked === true) {
+      return res.status(403).json({ message: "Account is blocked." });
+    }
+
+    req.auth = {
+      id: subject,
+      name: typeof user.name === "string" ? user.name : "",
+      email: typeof user.email === "string" ? user.email : "",
+      role: user.role === "admin" ? "admin" : "customer",
+    };
+
+    return next();
+  } catch (error) {
+    console.error("Failed to load the signed-in user:", error);
+    return res
+      .status(500)
+      .json({ message: "Could not verify the signed-in user." });
+  }
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.auth || !roles.includes(req.auth.role)) {
+      return res
+        .status(403)
+        .json({ message: "You do not have access to this resource." });
+    }
+
+    next();
+  };
+}
+
+const adminOnly = [verifyJWT, requireRole("admin")];
+const customerOnly = [verifyJWT, requireRole("customer")];
+const customerOrAdmin = [verifyJWT, requireRole("customer", "admin")];
+const serviceOnly = [verifyJWT, requireRole("service")];
+
 app.get("/", (_req, res) => {
   res.send("TESTING...");
 });
 
-// Admin user management. Requests are role-checked by the Next.js API proxy.
-app.get("/admin/users", async (_req, res) => {
+// Admin user management.
+app.get("/admin/users", ...adminOnly, async (_req, res) => {
   try {
     const result = await users
       .find({})
@@ -102,35 +203,39 @@ app.get("/admin/users", async (_req, res) => {
   }
 });
 
-app.patch("/admin/users/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { isBlocked } = req.body ?? {};
+app.patch(
+  "/admin/users/:id",
+  ...adminOnly,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { isBlocked } = req.body ?? {};
 
-    if (!id || typeof isBlocked !== "boolean") {
-      return res.status(400).json({ message: "Invalid user update." });
+      if (!id || typeof isBlocked !== "boolean") {
+        return res.status(400).json({ message: "Invalid user update." });
+      }
+
+      const userIdFilter = ObjectId.isValid(id)
+        ? { $or: [{ _id: id }, { _id: new ObjectId(id) }] }
+        : { _id: id };
+      const result = await users.updateOne(
+        { $and: [userIdFilter, { role: { $ne: "admin" } }] },
+        { $set: { isBlocked } }
+      );
+
+      if (result.matchedCount !== 1) {
+        return res.status(404).json({ message: "Customer user not found." });
+      }
+
+      res.json({ id, isBlocked });
+    } catch (error) {
+      console.error("Failed to update user:", error);
+      res.status(500).json({ message: "Failed to update user." });
     }
-
-    const userIdFilter = ObjectId.isValid(id)
-      ? { $or: [{ _id: id }, { _id: new ObjectId(id) }] }
-      : { _id: id };
-    const result = await users.updateOne(
-      { $and: [userIdFilter, { role: { $ne: "admin" } }] },
-      { $set: { isBlocked } }
-    );
-
-    if (result.matchedCount !== 1) {
-      return res.status(404).json({ message: "Customer user not found." });
-    }
-
-    res.json({ id, isBlocked });
-  } catch (error) {
-    console.error("Failed to update user:", error);
-    res.status(500).json({ message: "Failed to update user." });
   }
-});
+);
 
-app.get("/admin/overview", async (_req, res) => {
+app.get("/admin/overview", ...adminOnly, async (_req, res) => {
   try {
     const [
       totalCustomers,
@@ -162,7 +267,7 @@ app.get("/admin/overview", async (_req, res) => {
   }
 });
 
-app.get("/admin/services", async (_req, res) => {
+app.get("/admin/services", ...adminOnly, async (_req, res) => {
   try {
     const result = await serviceCollection
       .find({})
@@ -175,7 +280,7 @@ app.get("/admin/services", async (_req, res) => {
   }
 });
 
-app.post("/admin/services", async (req, res) => {
+app.post("/admin/services", ...adminOnly, async (req, res) => {
   try {
     const { serviceName, category, description, price, duration, status } =
       req.body ?? {};
@@ -216,7 +321,7 @@ app.post("/admin/services", async (req, res) => {
   }
 });
 
-app.patch("/admin/services/:id", async (req, res) => {
+app.patch("/admin/services/:id", ...adminOnly, async (req, res) => {
   try {
     const { id } = req.params;
     const { serviceName, category, description, price, duration, status } =
@@ -274,7 +379,7 @@ app.patch("/admin/services/:id", async (req, res) => {
   }
 });
 
-app.delete("/admin/services/:id", async (req, res) => {
+app.delete("/admin/services/:id", ...adminOnly, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid service ID." });
@@ -349,12 +454,12 @@ app.get("/services/:id", async (req, res) => {
 });
 
 
-app.get("/appointments", async (req, res) => {
+app.get("/appointments", ...customerOrAdmin, async (req, res) => {
   try {
+    // Admins see every appointment; customers only ever see their own. The
+    // filter comes from the verified token, never from the query string.
     const filter =
-      typeof req.query.customerId === "string"
-        ? { customerId: req.query.customerId }
-        : {};
+      req.auth.role === "admin" ? {} : { customerId: req.auth.id };
 
     const result = await appointments
       .find(filter)
@@ -405,18 +510,18 @@ app.get("/appointments", async (req, res) => {
   }
 });
 
-app.get("/appointments/:id", async (req, res) => {
+app.get("/appointments/:id", ...customerOrAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { customerId } = req.query;
 
-    if (!ObjectId.isValid(id) || typeof customerId !== "string") {
+    if (!ObjectId.isValid(id)) {
       return res.status(404).json({ message: "Appointment not found." });
     }
 
+    // Customers can only read their own appointment; admins can read any.
     const appointment = await appointments.findOne({
       _id: new ObjectId(id),
-      customerId,
+      ...(req.auth.role === "admin" ? {} : { customerId: req.auth.id }),
     });
     if (!appointment) {
       return res.status(404).json({ message: "Appointment not found." });
@@ -478,9 +583,9 @@ app.get("/appointment-slots", async (req, res) => {
   }
 });
 
-app.post("/appointments", async (req, res) => {
+app.post("/appointments", ...customerOnly, async (req, res) => {
   try {
-    const { serviceId, appointmentDate, timeSlot, additionalMessage, customer } =
+    const { serviceId, appointmentDate, timeSlot, additionalMessage } =
       req.body ?? {};
     const parsedAppointmentDate =
       typeof appointmentDate === "string"
@@ -500,11 +605,7 @@ app.post("/appointments", async (req, res) => {
       !appointmentTimeSlots.includes(timeSlot) ||
       (additionalMessage !== undefined &&
         (typeof additionalMessage !== "string" ||
-          additionalMessage.length > 1000)) ||
-      !customer ||
-      typeof customer.id !== "string" ||
-      typeof customer.name !== "string" ||
-      typeof customer.email !== "string"
+          additionalMessage.length > 1000))
     ) {
       return res.status(400).json({ message: "Invalid appointment request." });
     }
@@ -524,9 +625,9 @@ app.post("/appointments", async (req, res) => {
         serviceName: service.serviceName,
         serviceCategory: service.category ?? "",
         serviceImage: service.image ?? null,
-        customerId: customer.id,
-        customerName: customer.name,
-        customerEmail: customer.email,
+        customerId: req.auth.id,
+        customerName: req.auth.name,
+        customerEmail: req.auth.email,
         appointmentDate,
         timeSlot,
         additionalMessage: additionalMessage ?? "",
@@ -558,12 +659,13 @@ app.post("/appointments", async (req, res) => {
   }
 });
 
-app.patch("/appointments/:id/cancel", async (req, res) => {
+app.patch("/appointments/:id/cancel", ...customerOnly, async (req, res) => {
   try {
     const { id } = req.params;
-    const { customerId } = req.body;
+    // Ownership always comes from the verified token, never the request body.
+    const customerId = req.auth.id;
 
-    if (!ObjectId.isValid(id) || typeof customerId !== "string") {
+    if (!ObjectId.isValid(id)) {
       return res.status(400).json({ message: "Invalid cancellation request." });
     }
 
@@ -602,7 +704,7 @@ app.patch("/appointments/:id/cancel", async (req, res) => {
   }
 });
 
-app.patch("/appointments/:id/status", async (req, res) => {
+app.patch("/appointments/:id/status", ...adminOnly, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -643,10 +745,11 @@ app.patch("/appointments/:id/status", async (req, res) => {
   }
 });
 
-// Called by the verified Stripe webhook in the Next.js app. The caller only
-// supplies a Checkout Session id; every value written to the database is read
-// back from Stripe, so a forged request cannot fake a payment.
-app.post("/transactions", async (req, res) => {
+// Called by the verified Stripe webhook in the Next.js app. The Next server
+// authenticates with a short-lived service JWT. The caller only supplies a
+// Checkout Session id; every value written to the database is read back from
+// Stripe, so a forged request cannot fake a payment.
+app.post("/transactions", ...serviceOnly, async (req, res) => {
   try {
     const { stripeSessionId, status } = req.body ?? {};
 
@@ -834,7 +937,7 @@ app.post("/transactions", async (req, res) => {
   }
 });
 
-app.get("/transactions", async (_req, res) => {
+app.get("/transactions", ...adminOnly, async (_req, res) => {
   try {
     const result = await transactions
       .find({})
@@ -907,3 +1010,5 @@ app.use((error, _req, res, _next) => {
 app.listen(port, () => {
   console.log(`SalonBook is running on port ${port}`);
 });
+
+export default app;
