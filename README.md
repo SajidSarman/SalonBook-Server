@@ -1,4 +1,4 @@
-# SalonBook Server
+# SalonBook - Server
 
 REST API for SalonBook, built with Express and MongoDB. It verifies JWTs issued by the Next.js app, enforces role-based access.
 
@@ -16,13 +16,13 @@ https://salonbook-b14-a09-server.vercel.app/
 - Duplicate booking and inactive-service protection
 
 ## Technology Stack
-Node.js, Express, MongoDB, jwt(jose), Stripe
+Node.js, Express, MongoDB, JWT(jose), Stripe
 
 ## Installation
 ```bash
-git clone 
-cd
-npm ci
+git clone https://github.com/SajidSarman/SalonBook-Server.git
+cd SalonBook-Server
+npm install
 ```
 
 ## Run Locally
@@ -31,5 +31,16 @@ npm ci
 3. Run:
 ```bash
 nodemon index.js
-
 ```
+The API runs on http://localhost:5000.
+
+## Environment Variables
+```
+PORT=
+MONGODB_URI=
+BETTER_AUTH_URL=
+JWT_ISSUER=
+JWT_AUDIENCE=
+STRIPE_SECRET_KEY=
+```
+
