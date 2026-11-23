@@ -169,7 +169,7 @@ const customerOrAdmin = [verifyJWT, requireRole("customer", "admin")];
 const serviceOnly = [verifyJWT, requireRole("service")];
 
 app.get("/", (_req, res) => {
-  res.send("TESTING...");
+  res.send({ message: "Server is running fine!" });
 });
 
 // Admin user management.
