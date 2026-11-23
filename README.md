@@ -6,8 +6,7 @@ REST API for SalonBook, built with Express and MongoDB. It verifies JWTs issued 
 https://salonbook-b14-a09-server.vercel.app/
 
 ## Repositories
-- Client:
-- Server: 
+- Client: https://github.com/SajidSarman/SalonBook
 
 ## Important Features
 - JWT verification middleware (jose + Better Auth JWKS) with server-side role and block checks
@@ -23,14 +22,14 @@ Node.js, Express, MongoDB, jwt(jose), Stripe
 ```bash
 git clone 
 cd
-npm install
+npm ci
 ```
 
 ## Run Locally
-1. Copy `.env.example` to `.env` and fill in the values.
+1. Add `.env` and fill in the values.
 2. Make sure the client app is running, since the server reads its JWKS endpoint.
 3. Run:
 ```bash
-npm run dev
+nodemon index.js
 
 ```
