@@ -168,6 +168,21 @@ const customerOnly = [verifyJWT, requireRole("customer")];
 const customerOrAdmin = [verifyJWT, requireRole("customer", "admin")];
 const serviceOnly = [verifyJWT, requireRole("service")];
 
+// Service images come from the imgbb upload endpoint on the Next.js side.
+// Only absolute http(s) URLs are accepted so nothing like `javascript:` can be
+// stored and rendered later.
+function isValidImage(value) {
+  if (value === undefined || value === null) {
+    return true;
+  }
+
+  return (
+    typeof value === "string" &&
+    value.length <= 1000 &&
+    /^https?:\/\//i.test(value)
+  );
+}
+
 app.get("/", (_req, res) => {
   res.send({ message: "Server is running fine!" });
 });
@@ -192,7 +207,10 @@ app.get("/admin/users", ...adminOnly, async (_req, res) => {
         id: user._id.toString(),
         name: typeof user.name === "string" ? user.name : "",
         email: typeof user.email === "string" ? user.email : "",
-        image: typeof user.image === "string" ? user.image : null,
+        image:
+          typeof user.image === "string" && user.image
+            ? user.image
+            : null,
         role: user.role === "admin" ? "admin" : "customer",
         isBlocked: user.isBlocked === true,
       }))
@@ -282,7 +300,7 @@ app.get("/admin/services", ...adminOnly, async (_req, res) => {
 
 app.post("/admin/services", ...adminOnly, async (req, res) => {
   try {
-    const { serviceName, category, description, price, duration, status } =
+    const { serviceName, category, description, price, duration, image, status } =
       req.body ?? {};
 
     if (
@@ -298,6 +316,7 @@ app.post("/admin/services", ...adminOnly, async (req, res) => {
       typeof duration !== "number" ||
       !Number.isFinite(duration) ||
       duration <= 0 ||
+      !isValidImage(image) ||
       (status !== undefined && status !== "active" && status !== "inactive")
     ) {
       return res.status(400).json({ message: "Invalid service details." });
@@ -309,7 +328,7 @@ app.post("/admin/services", ...adminOnly, async (req, res) => {
       description: description.trim(),
       price,
       duration,
-      image: null,
+      image: typeof image === "string" ? image : null,
       status: status ?? "active",
       createdAt: new Date(),
     };
@@ -324,7 +343,7 @@ app.post("/admin/services", ...adminOnly, async (req, res) => {
 app.patch("/admin/services/:id", ...adminOnly, async (req, res) => {
   try {
     const { id } = req.params;
-    const { serviceName, category, description, price, duration, status } =
+    const { serviceName, category, description, price, duration, image, status } =
       req.body ?? {};
 
     if (
@@ -341,23 +360,30 @@ app.patch("/admin/services/:id", ...adminOnly, async (req, res) => {
       typeof duration !== "number" ||
       !Number.isFinite(duration) ||
       duration <= 0 ||
+      !isValidImage(image) ||
       (status !== "active" && status !== "inactive")
     ) {
       return res.status(400).json({ message: "Invalid service details." });
     }
 
+    const updates = {
+      serviceName: serviceName.trim(),
+      category: category.trim(),
+      description: description.trim(),
+      price,
+      duration,
+      status,
+    };
+
+    // `image` is optional: omitting it keeps the current image, while
+    // sending `null` clears it.
+    if (image !== undefined) {
+      updates.image = image === null ? null : image;
+    }
+
     const result = await serviceCollection.updateOne(
       { _id: new ObjectId(id) },
-      {
-        $set: {
-          serviceName: serviceName.trim(),
-          category: category.trim(),
-          description: description.trim(),
-          price,
-          duration,
-          status,
-        },
-      }
+      { $set: updates }
     );
 
     if (result.matchedCount !== 1) {
@@ -366,12 +392,13 @@ app.patch("/admin/services/:id", ...adminOnly, async (req, res) => {
 
     res.json({
       id,
-      serviceName,
-      category,
-      description,
-      price,
-      duration,
-      status,
+      serviceName: updates.serviceName,
+      category: updates.category,
+      description: updates.description,
+      price: updates.price,
+      duration: updates.duration,
+      image: updates.image,
+      status: updates.status,
     });
   } catch (error) {
     console.error("Failed to update service:", error);
